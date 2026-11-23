@@ -70,6 +70,18 @@ def mask(token):
     return f"{token[:6]}…{token[-4:]} (len={len(token)})"
 
 
+def jwt_claims(token):
+    """JWT payload dict (verify nahi karte)."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def jwt_info(token):
     """JWT payload se sirf expiry/keys nikalo (debug ke liye). Token verify nahi karte."""
     try:
@@ -190,7 +202,8 @@ def get_authorization_token(session, trace, site, force_refresh=False):
         ttl = 600  # max 10 min cache (rooter token jaldi invalid ho jata hai)
         if isinstance(info.get("exp_in_s"), int):
             ttl = max(0, min(ttl, info["exp_in_s"] - 60))
-        TOKEN_CACHE[n] = {"token": token, "expires_at": now + ttl}
+        TOKEN_CACHE[n] = {"token": token, "expires_at": now + ttl,
+                          "client_id": session.cookies.get("client_id")}
         trace.add(f"{n}.token.parse", True, token=mask(token), cookie=cookie_name,
                   jwt=info, cache_ttl_s=ttl)
         return token
@@ -215,19 +228,15 @@ def api_error(resp):
         return f"HTTP {resp.status_code}"
 
 
-def fetch_username_from_site(uid, trace, site, force_refresh=False):
+def try_username(uid, trace, site, session, token, device_id, source):
+    """Ek Device-Id ke saath username call. Return (username, auth_failed)."""
     n = site["name"]
-    session = requests.Session()
-    token = get_authorization_token(session, trace, site, force_refresh=force_refresh)
-    if not token:
-        return None
-
     url = f"https://bazaar.rooter.io/order/getUnipinUsername?gameCode=BGMI_IN&id={uid}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Device-Type": "web",
         "App-Version": "1.0.0",
-        "Device-Id": "api-service",
+        "Device-Id": device_id,
         "User-Agent": UA,
         "Accept": "application/json",
         "Origin": site["origin"],
@@ -239,66 +248,106 @@ def fetch_username_from_site(uid, trace, site, force_refresh=False):
 
     try:
         resp = call()
+        # 499 / 5xx = rooter ka upstream error, ek baar retry
+        if resp.status_code == 499 or resp.status_code >= 500:
+            trace.add(f"{n}.username.upstream_error", False, device_source=source,
+                      status=resp.status_code, error=api_error(resp))
+            time.sleep(1.5)
+            resp = call()
+
         trace.add(f"{n}.username.request", resp.status_code == 200, url=url,
-                  status=resp.status_code, content_type=resp.headers.get("Content-Type"),
+                  device_source=source, status=resp.status_code,
+                  content_type=resp.headers.get("Content-Type"),
                   blocked_hints=looks_blocked(resp) or None,
                   error=None if resp.status_code == 200 else api_error(resp),
                   body_preview=snippet(resp.text))
 
-        # 499 / 5xx = rooter ka upstream error, ek baar retry
-        if resp.status_code == 499 or resp.status_code >= 500:
-            time.sleep(1.5)
-            resp = call()
-            trace.add(f"{n}.username.retry_upstream", resp.status_code == 200,
-                      status=resp.status_code,
-                      error=None if resp.status_code == 200 else api_error(resp),
-                      body_preview=snippet(resp.text))
-
-        # Token expire / invalid -> refresh once and retry
         if resp.status_code in (401, 403):
-            token = get_authorization_token(session, trace, site, force_refresh=True)
-            if not token:
-                return None
-            headers["Authorization"] = f"Bearer {token}"
-            resp = call()
-            trace.add(f"{n}.username.retry_token", resp.status_code == 200,
-                      status=resp.status_code, body_preview=snippet(resp.text))
+            return None, True
 
         try:
             data = resp.json()
         except Exception as e:
             trace.add(f"{n}.username.json", False,
                       error=f"Response JSON nahi hai: {e}", body_preview=snippet(resp.text))
-            return None
+            return None, False
 
         transaction = data.get("transaction") if isinstance(data, dict) else None
         if transaction == "SUCCESS":
             username = (data.get("unipinRes") or {}).get("username")
             trace.add(f"{n}.username.result", bool(username), username=username,
+                      device_source=source,
                       error=None if username else "SUCCESS aaya par 'unipinRes.username' empty hai",
                       raw=None if username else snippet(json.dumps(data), 400))
-            return username
+            return username, False
 
         err = ((data.get("unipinRes") or {}).get("error") or data.get("error") or {}) if isinstance(data, dict) else {}
         if not isinstance(err, dict):
             err = {}
         auth_failed = (err.get("code") == 703
                        or "authentication" in str(err.get("message", "")).lower())
-        trace.add(f"{n}.username.result", False,
+        trace.add(f"{n}.username.result", False, device_source=source,
                   error=f"{n}: SUCCESS nahi mila (transaction={transaction!r}, "
                         f"rooter_error={err.get('message')!r}, code={err.get('code')})",
                   auth_failed=auth_failed,
                   raw=snippet(json.dumps(data), 400))
-
-        # "Authentication not match" (703) = token purana/invalid -> naya token lekar ek baar retry
-        if auth_failed and not force_refresh:
-            trace.add(f"{n}.username.auth_retry", True,
-                      note="703/auth error aaya, cached token hata ke fresh token se retry")
-            TOKEN_CACHE.pop(n, None)
-            return fetch_username_from_site(uid, trace, site, force_refresh=True)
+        return None, auth_failed
     except Exception as e:
         trace.add(f"{n}.username.exception", False, error=f"{type(e).__name__}: {e}")
         log.error("Username fetch error (%s) for %s: %s", n, uid, e)
+        return None, False
+
+
+def fetch_username_from_site(uid, trace, site, force_refresh=False):
+    n = site["name"]
+    session = requests.Session()
+    token = get_authorization_token(session, trace, site, force_refresh=force_refresh)
+    if not token:
+        return None
+
+    # "Authentication not match" (703) aksar tab aata hai jab Device-Id token ke 'device' claim se
+    # match nahi karta. Isliye alag-alag Device-Id try karte hain.
+    client_id = session.cookies.get("client_id") or (TOKEN_CACHE.get(n) or {}).get("client_id")
+    device_claim = jwt_claims(token).get("device")
+    device_val = None
+    if isinstance(device_claim, str):
+        device_val = device_claim
+    elif isinstance(device_claim, dict):
+        for k in ("id", "deviceId", "device_id", "uuid"):
+            if isinstance(device_claim.get(k), str):
+                device_val = device_claim[k]
+                break
+
+    candidates = []
+    for label, val in (("jwt.device", device_val), ("cookie.client_id", client_id),
+                       ("static", "api-service")):
+        if val and val not in [c[1] for c in candidates]:
+            candidates.append((label, val))
+
+    trace.add(f"{n}.device_candidates", True,
+              device_claim_type=type(device_claim).__name__,
+              device_claim_keys=sorted(device_claim.keys()) if isinstance(device_claim, dict) else None,
+              device_claim_preview=snippet(device_claim, 10) if device_claim is not None else None,
+              client_id_preview=snippet(client_id, 10) if client_id else None,
+              device_claim_equals_client_id=bool(device_val and client_id and device_val == client_id),
+              will_try=[c[0] for c in candidates])
+
+    any_auth_failed = False
+    for label, device_id in candidates:
+        username, auth_failed = try_username(uid, trace, site, session, token, device_id, label)
+        if username:
+            trace.add(f"{n}.device_id_worked", True, device_source=label)
+            return username
+        any_auth_failed = any_auth_failed or auth_failed
+        if not auth_failed:
+            return None  # auth ka masla nahi hai, doosra Device-Id try karne ka fayda nahi
+
+    # Sab Device-Id me auth fail -> fresh token se ek baar aur
+    if any_auth_failed and not force_refresh:
+        trace.add(f"{n}.username.auth_retry", True,
+                  note="sab Device-Id pe auth fail, fresh token se ek baar retry")
+        TOKEN_CACHE.pop(n, None)
+        return fetch_username_from_site(uid, trace, site, force_refresh=True)
     return None
 
 
