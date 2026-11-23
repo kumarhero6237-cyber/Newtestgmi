@@ -48,6 +48,11 @@ SITES = [
 ]
 DEBUG_KEY = os.environ.get("DEBUG_KEY")
 
+# Logged-in rooter account ka token (private use). Env var ROOTER_TOKEN set ho to wo pehle use hota hai.
+# Token expire hone par (debug me 'exp_in_s' dikhta hai) rooterlogin.py se naya nikalke yahan badal do.
+# NOTE: is repo ko PRIVATE rakho.
+ROOTER_TOKEN_FALLBACK = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjIxMDUyMTk1OTEsInNJZCI6ImNhYjdhNWZmLWE2MGUtNDMxOS04NzNmLTQ1M2Y1MDBjNDliNyIsInJvbGVzIjpbXSwiZGV2aWNlIjoid2ViIiwic2ZDcmVhdGVkQXQiOjE3OTU0MzMzMDgsImlzVmVyaWZpZWQiOnRydWUsInVzZXJSb2xlcyI6e30sImlhdCI6MTc5NTQzNTY4NiwiZXhwIjoxNzk5MzIzNjg2fQ.3DLegcekcXTTdO7eJC-oCrIwmTb5sY2cS_gxU-I49dQ"
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -168,6 +173,21 @@ def extract_token(session):
 def get_authorization_token(session, trace, site, force_refresh=False):
     n = site["name"]
     now = time.time()
+
+    # Logged-in account ka token (Vercel env var ROOTER_TOKEN) — guest token reject ho raha ho to ye use hota hai
+    env_token = (os.environ.get("ROOTER_TOKEN", "") or ROOTER_TOKEN_FALLBACK).strip()
+    # Pura user_auth cookie value paste kar diya ho ({"accessToken":...} ya URL-encoded) to usme se token nikalo
+    if env_token.startswith(("{", "%7B", "%7b")):
+        try:
+            env_token = json.loads(unquote(env_token)).get("accessToken", "") or ""
+        except Exception:
+            trace.add(f"{n}.token.env", False, error="ROOTER_TOKEN parse nahi hua (sirf accessToken ya poori user_auth cookie value daalo)")
+            env_token = ""
+    if env_token:
+        trace.add(f"{n}.token.env", True, token=mask(env_token), jwt=jwt_info(env_token),
+                  note="ROOTER_TOKEN env var use ho raha hai (guest token nahi)")
+        return env_token
+
     cached = TOKEN_CACHE.get(n)
     if not force_refresh and cached and cached["expires_at"] > now:
         trace.add(f"{n}.token.cache", True, note="using cached token",
